@@ -1,0 +1,164 @@
+parameters:
+  - name: Projeto
+    type: string
+  
+  - name: NomeImagem
+    type: string
+
+  - name: TestesAdicionais
+    type: object
+    default: {}
+
+  - name: DeployHabilitado
+    type: boolean
+    default: true
+    
+variables:
+  - name: version
+    value: $(Build.BuildNumber)
+    readonly: true
+
+  - name: publishDirectory
+    value: ./publish
+    readonly: true
+
+  - name: containerRegistry
+    value: exemplo.azurecr.io
+    readonly: true
+
+  - name: containerRegistryServiceConnection
+    value: exemplo-cr-sc
+    readonly: true
+
+  - name: imageRepository
+    value: ${{ variables.containerRegistry }}/${{ parameters.NomeImagem }}
+    readonly: true
+
+  - name: kubernetesProjectName
+    value: NomeImagem
+    readonly: true
+
+  - name: kubernetesServiceConnection
+    value: exemplo-aks-sc
+    readonly: true
+
+  - name: manifestPath
+    value: $(Pipeline.Workspace)/drop/manifest.yml
+    readonly: true
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        pool:
+          vmImage: ubuntu-latest
+        workspace:
+          clean: all
+
+        steps:
+
+          - task: DotNetCoreCLI@2
+            displayName: Compilando o projeto
+            inputs:
+              command: publish
+              projects: '**/${{ parameters.Projeto }}.csproj'
+              arguments: -c Release -o ${{ variables.publishDirectory }}
+              workingDirectory: $(Build.SourcesDirectory)
+              publishWebProjects: false
+              zipAfterPublish: false
+              modifyOutputPath: false
+
+          - task: Docker@2
+            displayName: Compilando imagem
+            inputs:
+              command: build
+              dockerfile: '**/${{ parameters.Projeto }}/Dockerfile'
+              arguments: --build-arg PUBLISH_DIRECTORY=${{ variables.publishDirectory }}
+              buildContext: $(Build.SourcesDirectory)
+              repository: ${{ variables.imageRepository }}
+              containerRegistry: ${{ variables.containerRegistryServiceConnection }}
+              tags: |
+                ${{ variables.version }}
+                latest
+
+          - task: Docker@2
+            enabled: true
+            displayName: Publicando imagem
+            inputs:
+              command: push
+              repository: ${{ variables.imageRepository }}
+              containerRegistry: ${{ variables.containerRegistryServiceConnection }}
+              tags: |
+                ${{ variables.version }}
+                latest
+
+          - task: CopyFiles@2
+            displayName: Copiando arquivo para artefato
+            inputs:
+              SourceFolder: $(Build.SourcesDirectory)/infraestrutura/manifests/${{ parameters.Projeto }}
+              Contents: manifest.yml
+              TargetFolder: $(Build.ArtifactStagingDirectory)
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publicando artefato
+
+  - stage: Tests
+    jobs:
+      - job: Tests
+        pool:
+          vmImage: ubuntu-latest
+        workspace:
+          clean: all
+
+        steps:
+
+          - task: DotNetCoreCLI@2
+            displayName: Executando testes de unidade
+            inputs:
+              command: test
+              projects: '**/${{ parameters.Projeto }}.Testes.csproj'
+              workingDirectory: $(Build.SourcesDirectory)
+              arguments: -c Release
+
+          - ${{ each projetoTeste in parameters.TestesAdicionais }}:
+            - task: DotNetCoreCLI@2
+              displayName: Executando testes do ${{ projetoTeste }}
+              inputs:
+                command: test
+                projects: '**/${{ projetoTeste }}.csproj'
+                workingDirectory: $(Build.SourcesDirectory)
+
+  - stage: Deploy
+    dependsOn:
+      - Build
+      - Tests
+    condition: and(${{ parameters.DeployHabilitado }}, succeeded())
+    jobs:
+      - deployment: Deploy
+        pool:
+          vmImage: ubuntu-latest
+        workspace:
+          clean: all
+        environment: exemplo-env-aks-testes
+        strategy:
+          runOnce:
+            deploy:
+              
+              steps:
+              
+                - task: replacetokens@3
+                  displayName: Substituindo tokens
+                  inputs:
+                    targetFiles: ${{ variables.manifestPath }}
+                    encoding: auto
+                    writeBOM: true
+                    actionOnMissing: warn
+                    keepToken: false
+                    useLegacyPattern: false
+                    enableTelemetry: true
+
+                - task: KubernetesManifest@0
+                  displayName: Deploy
+                  inputs:
+                    kubernetesServiceConnection: ${{ variables.kubernetesServiceConnection }}
+                    manifests: ${{ variables.manifestPath }}
